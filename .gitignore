@@ -1,0 +1,21 @@
+# Environment variables
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# Node.js
+node_modules/
+
+# Logs
+logs/
+*.log
+
+# Build files
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
