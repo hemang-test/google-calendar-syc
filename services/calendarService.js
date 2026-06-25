@@ -3,6 +3,24 @@ const { oauth2Client } = require('../config/google');
 const pool = require('../config/db');
 
 const DEFAULT_CALENDAR_ID = 'primary';
+let googleIndexesReady = false;
+
+async function ensureGoogleSyncIndexes() {
+  if (googleIndexesReady) return;
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_calendar_events_user_status_start
+    ON calendar_events (user_id, status, start_time)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_calendar_events_user_google_event
+    ON calendar_events (user_id, google_event_id)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_sync_state_user_calendar
+    ON sync_state (user_id, calendar_id)
+  `);
+  googleIndexesReady = true;
+}
 
 /**
  * Build an authenticated OAuth client for a user
@@ -321,6 +339,7 @@ async function getEvent(userId, eventId, calendarId = DEFAULT_CALENDAR_ID) {
  * Google recommends incremental sync using nextSyncToken
  */
 async function syncCalendarEvents(userId, calendarId = DEFAULT_CALENDAR_ID) {
+  await ensureGoogleSyncIndexes();
   const authClient = await getAuthClientForUser(userId);
   const calendar = google.calendar({ version: 'v3', auth: authClient });
 
