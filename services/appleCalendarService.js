@@ -1,3 +1,4 @@
+const { randomUUID } = require('crypto');
 const { createDAVClient } = require('tsdav');
 const pool = require('../config/db');
 
@@ -92,6 +93,99 @@ function extractField(icalData, key) {
   return match[1]
     .replace(/\r?\n[ \t]/g, '')
     .trim();
+}
+
+function escapeICalText(value) {
+  if (!value) return '';
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/;/g, '\\;')
+    .replace(/,/g, '\\,')
+    .replace(/\r?\n/g, '\\n');
+}
+
+function formatICalUtc(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+}
+
+function formatICalDateLine(field, value) {
+  if (!value) return null;
+  if (!value.includes('T')) {
+    const dateOnly = value.replace(/-/g, '').slice(0, 8);
+    return `${field};VALUE=DATE:${dateOnly}`;
+  }
+  return `${field}:${formatICalUtc(new Date(value))}`;
+}
+
+function extractRrules(icalData) {
+  if (!icalData) return [];
+  const matches = icalData.match(/^RRULE:.+$/gm) || [];
+  return matches.map((line) => line.replace(/^RRULE:/, ''));
+}
+
+function generateEventUid() {
+  return `${randomUUID()}@gcal-sync-demo.local`;
+}
+
+function toEventInputDate(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
+}
+
+function buildICalString({
+  uid,
+  summary,
+  description,
+  start,
+  end,
+  location,
+  recurrence,
+  status = 'CONFIRMED',
+  dtstamp,
+}) {
+  const lines = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//gcal-sync-demo//EN',
+    'CALSCALE:GREGORIAN',
+    'BEGIN:VEVENT',
+    `UID:${uid}`,
+    `DTSTAMP:${formatICalUtc(dtstamp || new Date())}`,
+    formatICalDateLine('DTSTART', start),
+    formatICalDateLine('DTEND', end),
+    `SUMMARY:${escapeICalText(summary || '(No title)')}`,
+  ];
+
+  if (description) lines.push(`DESCRIPTION:${escapeICalText(description)}`);
+  if (location) lines.push(`LOCATION:${escapeICalText(location)}`);
+  if (status) lines.push(`STATUS:${String(status).toUpperCase()}`);
+
+  if (recurrence?.length) {
+    for (const rule of recurrence) {
+      const rrule = rule.startsWith('RRULE:') ? rule.slice(6) : rule;
+      lines.push(`RRULE:${rrule}`);
+    }
+  }
+
+  lines.push('END:VEVENT', 'END:VCALENDAR');
+  return `${lines.filter(Boolean).join('\r\n')}\r\n`;
+}
+
+function mapToApiEvent(mapped) {
+  return {
+    id: mapped.uid,
+    apple_event_uid: mapped.uid,
+    calendar_id: mapped.calendarId,
+    summary: mapped.summary,
+    description: mapped.description,
+    start_time: mapped.startTime,
+    end_time: mapped.endTime,
+    status: mapped.status,
+    etag: mapped.etag || null,
+  };
 }
 
 function mapCalendarObject(calendar, object) {
@@ -189,6 +283,72 @@ async function fetchAppleCalendars(userId) {
   }));
 }
 
+async function resolveAppleCalendar(client, calendarId) {
+  const calendars = await client.fetchCalendars();
+  if (!calendars.length) {
+    throw new Error('No Apple calendars found');
+  }
+
+  if (calendarId) {
+    const match = calendars.find(
+      (cal) => (cal.url || cal.href) === calendarId || cal.displayName === calendarId
+    );
+    if (!match) {
+      throw new Error(`Apple calendar not found: ${calendarId}`);
+    }
+    return match;
+  }
+
+  const home = calendars.find(
+    (cal) => (cal.displayName || '').toLowerCase().includes('home')
+      || (cal.url || '').toLowerCase().includes('/home')
+  );
+  return home || calendars[0];
+}
+
+async function getAppleEventFromDb(userId, eventUid, calendarId) {
+  await ensureAppleSchema();
+  let query = `
+    SELECT id, calendar_id, apple_event_uid, etag, summary, description,
+           start_time, end_time, status, raw_data
+    FROM apple_calendar_events
+    WHERE user_id = $1 AND apple_event_uid = $2
+  `;
+  const params = [userId, eventUid];
+
+  if (calendarId) {
+    query += ` AND calendar_id = $${params.length + 1}`;
+    params.push(calendarId);
+  }
+
+  const { rows } = await pool.query(query, params);
+  return rows[0] || null;
+}
+
+async function findCalendarObject(client, calendar, eventUid, existingRaw) {
+  const objectUrl = existingRaw?.calendarObject?.url;
+  if (objectUrl) {
+    const objects = await client.fetchCalendarObjects({
+      calendar,
+      objectUrls: [objectUrl],
+    });
+    if (objects[0]) return objects[0];
+  }
+
+  const objects = await client.fetchCalendarObjects({ calendar });
+  const match = objects.find((obj) => extractField(obj.data || '', 'UID') === eventUid);
+  if (!match) {
+    throw new Error('Apple calendar event not found on server');
+  }
+  return match;
+}
+
+async function assertCalDavResponse(response, action) {
+  if (response.ok) return;
+  const body = await response.text().catch(() => '');
+  throw new Error(`Failed to ${action} Apple calendar event: ${response.status} ${body}`.trim());
+}
+
 async function upsertAppleEvent(userId, event) {
   await pool.query(
     `INSERT INTO apple_calendar_events
@@ -275,6 +435,131 @@ async function syncAppleCalendarEvents(userId) {
   return { totalSynced, calendars: calendars.length };
 }
 
+/**
+ * Create a calendar event on Apple iCloud via CalDAV and persist locally.
+ */
+async function createAppleEvent(userId, eventData, calendarId) {
+  await ensureAppleSchema();
+  const { summary, description, start, end, location, recurrence } = eventData;
+
+  if (!summary || !start || !end) {
+    throw new Error('summary, start, and end are required');
+  }
+
+  const client = await getAppleClient(userId);
+  const calendar = await resolveAppleCalendar(client, calendarId);
+  const resolvedCalendarId = calendar.url || calendar.href;
+  const uid = generateEventUid();
+  const iCalString = buildICalString({
+    uid,
+    summary,
+    description,
+    start,
+    end,
+    location,
+    recurrence,
+  });
+
+  const response = await client.createCalendarObject({
+    calendar,
+    iCalString,
+    filename: `${uid}.ics`,
+  });
+  await assertCalDavResponse(response, 'create');
+
+  const mapped = mapCalendarObject(calendar, {
+    url: new URL(`${uid}.ics`, resolvedCalendarId).href,
+    data: iCalString,
+    etag: response.headers?.get?.('etag') || null,
+  });
+
+  await upsertAppleEvent(userId, mapped);
+  return mapToApiEvent(mapped);
+}
+
+/**
+ * Update an existing Apple calendar event via CalDAV and sync changes to local DB.
+ */
+async function updateAppleEvent(userId, eventUid, eventData, options = {}) {
+  await ensureAppleSchema();
+  const calendarId = options.calendarId || eventData.calendarId;
+
+  const existingRow = await getAppleEventFromDb(userId, eventUid, calendarId);
+  if (!existingRow) {
+    throw new Error('Apple calendar event not found in local database');
+  }
+
+  const rawData = typeof existingRow.raw_data === 'string'
+    ? JSON.parse(existingRow.raw_data)
+    : (existingRow.raw_data || {});
+
+  const client = await getAppleClient(userId);
+  const calendar = await resolveAppleCalendar(client, existingRow.calendar_id);
+  const calendarObject = await findCalendarObject(client, calendar, eventUid, rawData);
+
+  const existingIcal = calendarObject.data || '';
+  const merged = {
+    uid: eventUid,
+    summary: eventData.summary ?? existingRow.summary ?? extractField(existingIcal, 'SUMMARY'),
+    description: eventData.description !== undefined
+      ? eventData.description
+      : (existingRow.description ?? extractField(existingIcal, 'DESCRIPTION')),
+    start: eventData.start ?? toEventInputDate(existingRow.start_time) ?? parseICalDateTime(extractField(existingIcal, 'DTSTART')),
+    end: eventData.end ?? toEventInputDate(existingRow.end_time) ?? parseICalDateTime(extractField(existingIcal, 'DTEND')),
+    location: eventData.location !== undefined ? eventData.location : extractField(existingIcal, 'LOCATION'),
+    recurrence: eventData.recurrence ?? extractRrules(existingIcal),
+    status: eventData.status ?? existingRow.status ?? 'CONFIRMED',
+    dtstamp: extractField(existingIcal, 'DTSTAMP'),
+  };
+
+  if (!merged.summary || !merged.start || !merged.end) {
+    throw new Error('Event must retain summary, start, and end after update');
+  }
+
+  const iCalString = buildICalString(merged);
+  const updatedObject = {
+    url: calendarObject.url,
+    etag: calendarObject.etag,
+    data: iCalString,
+  };
+
+  const response = await client.updateCalendarObject({ calendarObject: updatedObject });
+  await assertCalDavResponse(response, 'update');
+
+  const mapped = mapCalendarObject(calendar, {
+    ...updatedObject,
+    etag: response.headers?.get?.('etag') || calendarObject.etag || existingRow.etag,
+  });
+
+  await upsertAppleEvent(userId, mapped);
+  return mapToApiEvent(mapped);
+}
+
+/**
+ * Get a single Apple event from the local database.
+ */
+async function getAppleEvent(userId, eventUid, calendarId) {
+  const row = await getAppleEventFromDb(userId, eventUid, calendarId);
+  if (!row) {
+    const err = new Error('Apple calendar event not found');
+    err.code = 404;
+    throw err;
+  }
+
+  return {
+    id: row.apple_event_uid,
+    apple_event_uid: row.apple_event_uid,
+    calendar_id: row.calendar_id,
+    summary: row.summary,
+    description: row.description,
+    start_time: row.start_time,
+    end_time: row.end_time,
+    status: row.status,
+    etag: row.etag,
+    raw_data: typeof row.raw_data === 'string' ? JSON.parse(row.raw_data) : row.raw_data,
+  };
+}
+
 async function getSyncedAppleEvents(userId, { from, to }) {
   await ensureAppleSchema();
   let query = `
@@ -303,5 +588,8 @@ module.exports = {
   connectAppleCalendar,
   fetchAppleCalendars,
   syncAppleCalendarEvents,
+  createAppleEvent,
+  updateAppleEvent,
+  getAppleEvent,
   getSyncedAppleEvents,
 };

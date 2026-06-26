@@ -3,6 +3,9 @@ const {
   connectAppleCalendar,
   fetchAppleCalendars,
   syncAppleCalendarEvents,
+  createAppleEvent,
+  updateAppleEvent,
+  getAppleEvent,
   getSyncedAppleEvents,
 } = require('../services/appleCalendarService');
 
@@ -56,6 +59,50 @@ router.get('/events', requireLogin, async (req, res) => {
   } catch (err) {
     console.error('Apple events query error:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/events/:eventUid', requireLogin, async (req, res) => {
+  try {
+    const event = await getAppleEvent(
+      req.session.userId,
+      req.params.eventUid,
+      req.query.calendarId
+    );
+    res.json({ success: true, event });
+  } catch (err) {
+    console.error('Apple get event error:', err);
+    res.status(err.code === 404 ? 404 : 500).json({ error: err.message });
+  }
+});
+
+router.post('/events', requireLogin, async (req, res) => {
+  try {
+    const event = await createAppleEvent(
+      req.session.userId,
+      req.body,
+      req.body.calendarId
+    );
+    res.status(201).json({ success: true, event });
+  } catch (err) {
+    console.error('Apple create event error:', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.put('/events/:eventUid', requireLogin, async (req, res) => {
+  try {
+    const { calendarId, ...eventData } = req.body;
+    const event = await updateAppleEvent(
+      req.session.userId,
+      req.params.eventUid,
+      eventData,
+      { calendarId }
+    );
+    res.json({ success: true, event });
+  } catch (err) {
+    console.error('Apple update event error:', err);
+    res.status(400).json({ error: err.message });
   }
 });
 
