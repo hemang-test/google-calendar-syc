@@ -25,7 +25,9 @@ Consumers should read events from the local database (`calendar_events`, `apple_
 - **Apple iCloud sync** — CalDAV integration via `tsdav` for listing calendars and syncing events
 - **Apple event CRUD** — create, update, and fetch individual Apple events
 - **Local persistence** — normalized event storage with raw provider payloads in JSONB
-- **Scheduled background sync** — automatic re-sync for all users every 5 minutes
+- **Scheduled background sync** — multi-provider two-way sync with conflict resolution every 5 minutes
+- **Unified sync service** — provider abstraction layer supporting Google and Apple with extensible architecture
+- **Conflict resolution** — automatic (`last_write_wins`, `source_wins`, `local_wins`) or manual resolution
 
 ---
 
@@ -55,11 +57,19 @@ gcal-sync-demo/
 ├── routes/
 │   ├── auth.js                 # Google OAuth login/logout
 │   ├── calendar.js             # Google Calendar API routes
-│   └── appleCalendar.js        # Apple iCloud CalDAV routes
+│   ├── appleCalendar.js        # Apple iCloud CalDAV routes
+│   └── sync.js                 # Unified multi-provider sync API
 ├── services/
 │   ├── calendarService.js      # Google sync, CRUD, and DB upserts
 │   ├── freebusyService.js      # Google FreeBusy checks
-│   └── appleCalendarService.js # Apple CalDAV sync, CRUD, schema setup
+│   ├── appleCalendarService.js # Apple CalDAV sync, CRUD, schema setup
+│   └── sync/                   # Multi-provider sync architecture
+│       ├── providers/            # Provider adapters (Google, Apple)
+│       ├── syncService.js      # Sync orchestrator
+│       ├── syncJobRunner.js    # Background job scheduler
+│       ├── conflictResolver.js # Conflict detection & resolution
+│       ├── syncStrategies.js   # pull_only, push_only, two_way
+│       └── syncSchema.js       # Sync tables DDL
 ├── package.json
 ├── .env                        # Environment variables (not committed)
 ├── test.md                     # Detailed testing guide
@@ -194,6 +204,11 @@ DB_PASSWORD=your-db-password
 APPLE_ICLOUD_EMAIL=your-apple-id@icloud.com
 APPLE_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
 APPLE_SERVER_URL=https://caldav.icloud.com
+
+# Sync scheduler (optional)
+SYNC_CRON_SCHEDULE=*/5 * * * *
+SYNC_STRATEGY=two_way
+CONFLICT_STRATEGY=last_write_wins
 ```
 
 | Variable | Required | Description |
@@ -211,6 +226,9 @@ APPLE_SERVER_URL=https://caldav.icloud.com
 | `APPLE_ICLOUD_EMAIL` | No | Default Apple ID for CalDAV (per-user via API is preferred) |
 | `APPLE_APP_PASSWORD` | No | App-specific password for iCloud CalDAV |
 | `APPLE_SERVER_URL` | No | CalDAV server URL (default: `https://caldav.icloud.com`) |
+| `SYNC_CRON_SCHEDULE` | No | Cron expression for background sync (default: `*/5 * * * *`) |
+| `SYNC_STRATEGY` | No | Default sync strategy: `pull_only`, `push_only`, or `two_way` (default: `two_way`) |
+| `CONFLICT_STRATEGY` | No | Default conflict resolution: `last_write_wins`, `source_wins`, `local_wins`, or `manual` |
 
 > **Security:** Never commit `.env` to version control. It is listed in `.gitignore`.
 
@@ -227,6 +245,8 @@ npm run dev
 ### Production
 
 ```bash
+npm start
+# or
 node app.js
 ```
 
@@ -244,8 +264,7 @@ Expected output:
 3. You are redirected to `/calendar/sync` for an initial Google sync.
 4. (Optional) Connect Apple Calendar via `POST /apple-calendar/connect`.
 5. Use the API endpoints below to list or manage events.
-
-> **Note:** `npm start` is configured to run `src/app.js`, which does not exist. Use `npm run dev` or `node app.js` instead.
+6. Trigger multi-provider sync via `POST /sync` or wait for the background scheduler.
 
 ### Testing APIs with curl
 
@@ -321,6 +340,31 @@ curl -b cookies.txt -X POST http://localhost:3000/apple-calendar/connect \
   }'
 ```
 
+### Unified Sync Service
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/sync/status` | Provider connectivity, pending conflicts, last job |
+| `GET` | `/sync/providers` | List registered providers and which are connected |
+| `GET` | `/sync/strategies` | List available sync and conflict strategies |
+| `POST` | `/sync` | Trigger multi-provider sync for the current user |
+| `GET` | `/sync/jobs` | Sync job history (`?limit=20`) |
+| `GET` | `/sync/conflicts` | List unresolved sync conflicts |
+| `POST` | `/sync/conflicts/:id/resolve` | Manually resolve a conflict |
+| `POST` | `/sync/run-all` | Trigger background sync for all users |
+
+**Trigger two-way sync example:**
+
+```bash
+curl -b cookies.txt -X POST http://localhost:3000/sync \
+  -H "Content-Type: application/json" \
+  -d '{
+    "syncStrategy": "two_way",
+    "conflictStrategy": "last_write_wins",
+    "providers": ["google", "apple"]
+  }'
+```
+
 ---
 
 ## Calendar Synchronization Flow
@@ -384,14 +428,79 @@ sequenceDiagram
 - **Sync type:** Full sync per calendar on each run (schema supports `ctag`/`sync_token` for future incremental sync).
 - **Deletion handling:** Events no longer returned by iCloud are soft-deleted (`status = 'cancelled'`).
 
-### Background cron job
+### Background sync scheduler
 
-Every 5 minutes, the server:
+A dedicated sync job runner (`services/sync/syncJobRunner.js`) runs on a configurable cron schedule (default: every 5 minutes). Each cycle:
 
-1. Ensures Apple schema exists.
-2. Loads all users from the database.
-3. Runs `syncCalendarEvents(userId)` for Google.
-4. Runs `syncAppleCalendarEvents(userId)` for Apple (errors are caught so missing Apple credentials do not block Google sync).
+1. Ensures sync and Apple schemas exist.
+2. Loads all users and runs `syncUser()` for each via the unified sync service.
+3. Uses **two-way sync** by default: pull remote changes, detect conflicts, then push pending local changes.
+4. Logs job results to the `sync_jobs` table and skips overlapping runs.
+
+```mermaid
+sequenceDiagram
+    participant Cron
+    participant JobRunner
+    participant SyncService
+    participant Google
+    participant Apple
+    participant DB
+
+    Cron->>JobRunner: Every 5 min
+    JobRunner->>SyncService: syncAllUsers()
+    loop Each user
+        SyncService->>Google: pullChanges()
+        Google->>DB: Upsert calendar_events
+        SyncService->>Apple: pullChanges()
+        Apple->>DB: Upsert apple_calendar_events
+        SyncService->>SyncService: Detect & resolve conflicts
+        SyncService->>Google: pushChange() (pending)
+        SyncService->>Apple: pushChange() (pending)
+        SyncService->>DB: Record sync_jobs + sync_conflicts
+    end
+```
+
+### Multi-provider sync architecture
+
+```
+services/sync/
+├── providers/
+│   ├── BaseCalendarProvider.js   # Abstract provider interface
+│   ├── GoogleCalendarProvider.js # Google adapter
+│   ├── AppleCalendarProvider.js  # Apple CalDAV adapter
+│   └── index.js                  # Provider registry
+├── syncStrategies.js             # pull_only, push_only, two_way
+├── conflictResolver.js           # Conflict detection & resolution
+├── syncSchema.js                 # sync_jobs, sync_conflicts, sync_event_state
+├── syncService.js                # Orchestrator: syncUser(), syncAllUsers()
+└── syncJobRunner.js              # Cron scheduler with overlap protection
+```
+
+**Sync strategies:**
+
+| Strategy | Behavior |
+|----------|----------|
+| `pull_only` | Remote → local DB (inbound only) |
+| `push_only` | Local pending changes → remote (outbound only) |
+| `two_way` | Pull, resolve conflicts, then push (default) |
+
+**Conflict resolution strategies:**
+
+| Strategy | Behavior |
+|----------|----------|
+| `last_write_wins` | Compare timestamps; newest change wins (default) |
+| `source_wins` | Remote provider always wins |
+| `local_wins` | Local DB always wins; push to remote |
+| `manual` | Record conflict in `sync_conflicts`; skip auto-resolution |
+
+**Sync tables** (created automatically by `ensureSyncSchema()`):
+
+| Table | Purpose |
+|-------|---------|
+| `sync_jobs` | Job history with strategy, status, and results |
+| `sync_conflicts` | Detected conflicts (inbound and cross-provider) |
+| `sync_event_state` | Per-event version tracking and pending push flags |
+| `event_links` | Cross-provider event mapping (for future use) |
 
 ---
 
@@ -429,22 +538,17 @@ Google events live in `calendar_events`; Apple events live in `apple_calendar_ev
 
 ### Lazy schema and index creation
 
-- Apple tables/columns: created by `ensureAppleSchema()` on first Apple operation or cron run.
+- Apple tables/columns: created by `ensureAppleSchema()` on first Apple operation or sync run.
 - Google indexes: created by `ensureGoogleSyncIndexes()` on first sync.
+- Sync tables: created by `ensureSyncSchema()` on first sync operation.
 
 ---
 
 ## Troubleshooting
 
-### `npm start` fails — cannot find `src/app.js`
+### `npm start` fails
 
-The `start` script in `package.json` points to a non-existent path. Run the app with:
-
-```bash
-npm run dev
-# or
-node app.js
-```
+Ensure dependencies are installed (`npm install`) and `.env` is configured. The app entry point is `app.js`.
 
 ### `401 Not authenticated` on API calls
 
@@ -489,9 +593,10 @@ The app requires the full `calendar` scope (read + write). If you previously aut
 
 ### Cron sync not reflecting external changes
 
-- Wait up to 5 minutes for the scheduled job.
-- Watch server logs for `⏰ Running scheduled sync...` and `✅ Synced user {id}`.
-- Apple sync errors are logged as warnings and do not stop Google sync.
+- Wait up to 5 minutes for the scheduled job (or trigger manually via `POST /sync`).
+- Watch server logs for `⏰ Running scheduled sync job...` and `✅ Sync job completed`.
+- Check job history via `GET /sync/jobs`.
+- Provider-specific errors are logged per user and do not block other providers.
 
 ### Expired Google sync token (HTTP 410)
 
