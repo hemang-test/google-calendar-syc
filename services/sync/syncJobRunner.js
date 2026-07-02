@@ -1,7 +1,8 @@
 const cron = require('node-cron');
-const { syncAllUsers } = require('./syncService');
 const { ensureSyncSchema } = require('./syncSchema');
 const { ensureAppleSchema } = require('../appleCalendarService');
+const { enqueueJob, JOB_TYPES } = require('../queue/jobQueue');
+const { processQueueBatch } = require('../queue/queueWorker');
 const {
   SYNC_STRATEGIES,
   CONFLICT_STRATEGIES,
@@ -9,50 +10,40 @@ const {
   DEFAULT_CONFLICT_STRATEGY,
 } = require('./syncStrategies');
 
-let isRunning = false;
 let scheduledTask = null;
 
 const DEFAULT_CRON = '*/5 * * * *';
 
 /**
- * Run a single background sync cycle for all users.
+ * Enqueue a scheduled sync-all job (processed by the queue worker).
  */
 async function runSyncJob(options = {}) {
-  if (isRunning) {
-    console.warn('⏭️  Sync job already running, skipping this cycle');
-    return { skipped: true, reason: 'already_running' };
+  await ensureAppleSchema();
+  await ensureSyncSchema();
+
+  const syncStrategy = options.syncStrategy || process.env.SYNC_STRATEGY || DEFAULT_SYNC_STRATEGY;
+  const conflictStrategy = options.conflictStrategy || process.env.CONFLICT_STRATEGY || DEFAULT_CONFLICT_STRATEGY;
+
+  const idempotencyKey = options.idempotencyKey
+    || `sync_all_${new Date().toISOString().slice(0, 16)}`;
+
+  const job = await enqueueJob(
+    JOB_TYPES.SYNC_ALL,
+    { syncStrategy, conflictStrategy },
+    { idempotencyKey, priority: options.priority ?? 1 }
+  );
+
+  if (job.duplicate) {
+    console.log(`⏭️  Scheduled sync already queued (job ${job.id})`);
+    return { queued: false, queueJobId: job.id, duplicate: true };
   }
 
-  isRunning = true;
-  const startedAt = new Date();
-
-  try {
-    await ensureAppleSchema();
-    await ensureSyncSchema();
-
-    console.log('⏰ Running scheduled sync job...');
-    const result = await syncAllUsers({
-      jobType: 'scheduled',
-      syncStrategy: options.syncStrategy || process.env.SYNC_STRATEGY || DEFAULT_SYNC_STRATEGY,
-      conflictStrategy: options.conflictStrategy || process.env.CONFLICT_STRATEGY || DEFAULT_CONFLICT_STRATEGY,
-    });
-
-    const succeeded = result.results.filter((r) => r.success).length;
-    const failed = result.results.filter((r) => !r.success).length;
-    const elapsed = Date.now() - startedAt.getTime();
-
-    console.log(`✅ Sync job completed in ${elapsed}ms — ${succeeded} users OK, ${failed} failed`);
-    return { ...result, elapsedMs: elapsed };
-  } catch (err) {
-    console.error('❌ Sync job failed:', err.message);
-    throw err;
-  } finally {
-    isRunning = false;
-  }
+  console.log(`📥 Scheduled sync enqueued as job ${job.id}`);
+  return { queued: true, queueJobId: job.id };
 }
 
 /**
- * Start the cron-based background sync scheduler.
+ * Start cron scheduler that enqueues sync jobs + triggers queue processing.
  */
 function startSyncScheduler(options = {}) {
   const cronExpression = options.cronExpression
@@ -63,10 +54,13 @@ function startSyncScheduler(options = {}) {
     scheduledTask.stop();
   }
 
-  scheduledTask = cron.schedule(cronExpression, () => {
-    runSyncJob(options).catch((err) => {
-      console.error('Background sync error:', err.message);
-    });
+  scheduledTask = cron.schedule(cronExpression, async () => {
+    try {
+      await runSyncJob(options);
+      await processQueueBatch();
+    } catch (err) {
+      console.error('Background sync enqueue error:', err.message);
+    }
   });
 
   console.log(`📅 Sync scheduler started (cron: ${cronExpression})`);
@@ -82,7 +76,7 @@ function stopSyncScheduler() {
 }
 
 function isSyncJobRunning() {
-  return isRunning;
+  return false;
 }
 
 module.exports = {

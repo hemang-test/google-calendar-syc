@@ -7,7 +7,10 @@ const {
   getSyncStatus,
   getConnectedProviders,
 } = require('../services/sync/syncService');
-const { runSyncJob, isSyncJobRunning } = require('../services/sync/syncJobRunner');
+const { runSyncJob } = require('../services/sync/syncJobRunner');
+const { enqueueJob, JOB_TYPES } = require('../services/queue/jobQueue');
+const { notifyUser, WEBHOOK_EVENTS } = require('../services/webhooks/webhookNotifier');
+const { idempotencyMiddleware } = require('../middleware/idempotency');
 const {
   SYNC_STRATEGIES,
   CONFLICT_STRATEGIES,
@@ -24,6 +27,8 @@ function requireLogin(req, res, next) {
   }
   next();
 }
+
+router.use(idempotencyMiddleware({ methods: ['POST'] }));
 
 // GET /sync/status — provider connectivity and last job info
 router.get('/status', requireLogin, async (req, res) => {
@@ -51,10 +56,11 @@ router.get('/providers', requireLogin, async (req, res) => {
 });
 
 // POST /sync — trigger sync for the current user
-// Body: { syncStrategy, conflictStrategy, providers: ['google','apple'] }
+// Body: { syncStrategy, conflictStrategy, providers, async: true }
+// Header: Idempotency-Key (optional) — safe to retry without duplicate work
 router.post('/', requireLogin, async (req, res) => {
   try {
-    const { syncStrategy, conflictStrategy, providers } = req.body;
+    const { syncStrategy, conflictStrategy, providers, async: runAsync } = req.body;
 
     if (syncStrategy && !isValidSyncStrategy(syncStrategy)) {
       return res.status(400).json({
@@ -67,14 +73,52 @@ router.post('/', requireLogin, async (req, res) => {
       });
     }
 
-    const result = await syncUser(req.session.userId, {
+    const userId = req.session.userId;
+    const payload = {
+      userId,
+      syncStrategy,
+      conflictStrategy,
+      providers,
+      jobType: 'manual',
+    };
+
+    if (runAsync) {
+      const idempotencyKey = req.idempotencyKey
+        || req.headers['idempotency-key']
+        || req.headers['Idempotency-Key'];
+
+      const job = await enqueueJob(JOB_TYPES.SYNC_USER, payload, {
+        idempotencyKey: idempotencyKey || `sync_user_${userId}_${Date.now()}`,
+        priority: 2,
+      });
+
+      if (!job.duplicate) {
+        notifyUser(userId, WEBHOOK_EVENTS.SYNC_QUEUED, {
+          queueJobId: job.id,
+          syncStrategy,
+        }).catch((err) => console.warn('Webhook notify failed:', err.message));
+      }
+
+      return res.status(job.duplicate ? 200 : 202).json({
+        success: true,
+        async: true,
+        queueJobId: job.id,
+        status: job.status || 'pending',
+        duplicate: job.duplicate || false,
+        message: job.duplicate
+          ? 'Sync job already queued with this idempotency key'
+          : 'Sync job queued for background processing',
+      });
+    }
+
+    const result = await syncUser(userId, {
       syncStrategy,
       conflictStrategy,
       providers,
       jobType: 'manual',
     });
 
-    res.json({ success: true, ...result });
+    res.json({ success: true, async: false, ...result });
   } catch (err) {
     console.error('Sync error:', err);
     res.status(500).json({ error: err.message });
@@ -105,7 +149,6 @@ router.get('/conflicts', requireLogin, async (req, res) => {
 });
 
 // POST /sync/conflicts/:id/resolve — manually resolve a conflict
-// Body: { resolution: 'local_wins' | 'source_wins' | 'last_write_wins' }
 router.post('/conflicts/:id/resolve', requireLogin, async (req, res) => {
   try {
     const { resolution } = req.body;
@@ -136,15 +179,11 @@ router.get('/strategies', (_req, res) => {
   });
 });
 
-// POST /sync/run-all — admin-style trigger for all users (requires login)
+// POST /sync/run-all — enqueue background sync for all users
 router.post('/run-all', requireLogin, async (req, res) => {
-  if (isSyncJobRunning()) {
-    return res.status(409).json({ error: 'A sync job is already running' });
-  }
-
   try {
     const result = await runSyncJob(req.body);
-    res.json({ success: true, ...result });
+    res.status(result.duplicate ? 200 : 202).json({ success: true, ...result });
   } catch (err) {
     console.error('Run-all sync error:', err);
     res.status(500).json({ error: err.message });

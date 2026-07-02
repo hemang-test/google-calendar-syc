@@ -17,6 +17,7 @@ const {
   recordConflict,
   detectCrossProviderConflicts,
 } = require('./conflictResolver');
+const { notifyUser, WEBHOOK_EVENTS } = require('../webhooks/webhookNotifier');
 
 /**
  * Get providers that are connected for a given user.
@@ -282,9 +283,34 @@ async function syncUser(userId, options = {}) {
     }
 
     await completeSyncJob(jobId, result);
+
+    const totalConflicts = result.conflicts.length + result.crossProviderConflicts.length;
+    if (totalConflicts > 0) {
+      notifyUser(userId, WEBHOOK_EVENTS.CONFLICT_DETECTED, {
+        jobId,
+        conflictCount: totalConflicts,
+        conflicts: result.conflicts,
+        crossProviderConflicts: result.crossProviderConflicts,
+      }).catch((err) => console.warn('Webhook notify failed:', err.message));
+    }
+
+    notifyUser(userId, WEBHOOK_EVENTS.SYNC_COMPLETED, {
+      jobId,
+      syncStrategy,
+      providers: result.providers,
+      conflictCount: totalConflicts,
+    }).catch((err) => console.warn('Webhook notify failed:', err.message));
+
     return result;
   } catch (err) {
     await completeSyncJob(jobId, result, err.message);
+
+    notifyUser(userId, WEBHOOK_EVENTS.SYNC_FAILED, {
+      jobId,
+      error: err.message,
+      syncStrategy,
+    }).catch((whErr) => console.warn('Webhook notify failed:', whErr.message));
+
     throw err;
   }
 }
